@@ -77,6 +77,9 @@ def write_step_summary(lines: list[str]) -> None:
             f.write(text)
     else:
         print(text)  # local run — no GITHUB_STEP_SUMMARY file, just print instead
+
+
+def upsert_activities(conn: psycopg.Connection, activities: list[dict]) -> None:
     for a in activities:
         conn.execute(
             """
