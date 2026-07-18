@@ -27,7 +27,7 @@ import psycopg
 from dotenv import load_dotenv
 from garminconnect import Garmin
 
-load_dotenv()
+load_dotenv()  # reads .env in the current directory into os.environ, if present
 
 TOKEN_DIR = pathlib.Path.home() / ".garminconnect"
 DB_URL = os.environ["DATABASE_URL"]
@@ -57,7 +57,7 @@ def save_token_to_db(conn: psycopg.Connection) -> None:
         """
         insert into auth_tokens (provider, payload, updated_at)
         values ('garmin', %s, now())
-        on conflict (provider)
+            on conflict (provider)
         do update set payload = excluded.payload, updated_at = now()
         """,
         (json.dumps(payload),),
@@ -65,13 +65,24 @@ def save_token_to_db(conn: psycopg.Connection) -> None:
     conn.commit()
 
 
-def upsert_activities(conn: psycopg.Connection, activities: list[dict]) -> None:
+def table_count(conn: psycopg.Connection, table: str) -> int:
+    return conn.execute(f"select count(*) from {table}").fetchone()[0]  # noqa: S608 (fixed table names, not user input)
+
+
+def write_step_summary(lines: list[str]) -> None:
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    text = "\n".join(lines) + "\n"
+    if summary_path:
+        with open(summary_path, "a") as f:
+            f.write(text)
+    else:
+        print(text)  # local run — no GITHUB_STEP_SUMMARY file, just print instead
     for a in activities:
         conn.execute(
             """
             insert into activities (activity_id, raw, started_at)
             values (%s, %s, %s)
-            on conflict (activity_id) do update set raw = excluded.raw
+                on conflict (activity_id) do update set raw = excluded.raw
             """,
             (a["activityId"], json.dumps(a), a.get("startTimeLocal")),
         )
@@ -84,7 +95,7 @@ def upsert_challenges(conn: psycopg.Connection, challenges: list[dict]) -> None:
             """
             insert into challenges (challenge_id, raw, updated_at)
             values (%s, %s, now())
-            on conflict (challenge_id) do update set raw = excluded.raw, updated_at = now()
+                on conflict (challenge_id) do update set raw = excluded.raw, updated_at = now()
             """,
             (c["uuid"], json.dumps(c)),
         )
@@ -100,7 +111,7 @@ def upsert_earned_badges(conn: psycopg.Connection, badges: list[dict]) -> None:
             """
             insert into earned_badges (badge_id, raw, updated_at)
             values (%s, %s, now())
-            on conflict (badge_id) do update set raw = excluded.raw, updated_at = now()
+                on conflict (badge_id) do update set raw = excluded.raw, updated_at = now()
             """,
             (b["badgeId"], json.dumps(b)),
         )
@@ -114,7 +125,7 @@ def upsert_available_badges(conn: psycopg.Connection, badges: list[dict]) -> Non
             """
             insert into available_badges (badge_id, raw, updated_at)
             values (%s, %s, now())
-            on conflict (badge_id) do update set raw = excluded.raw, updated_at = now()
+                on conflict (badge_id) do update set raw = excluded.raw, updated_at = now()
             """,
             (b["badgeId"], json.dumps(b)),
         )
@@ -126,13 +137,13 @@ def upsert_daily_metrics(conn: psycopg.Connection, d: date, stats, sleep, stress
         """
         insert into daily_metrics (metric_date, stats, sleep, stress, hrv, max_metrics, updated_at)
         values (%s, %s, %s, %s, %s, %s, now())
-        on conflict (metric_date) do update set
+            on conflict (metric_date) do update set
             stats = excluded.stats,
-            sleep = excluded.sleep,
-            stress = excluded.stress,
-            hrv = excluded.hrv,
-            max_metrics = excluded.max_metrics,
-            updated_at = now()
+                                             sleep = excluded.sleep,
+                                             stress = excluded.stress,
+                                             hrv = excluded.hrv,
+                                             max_metrics = excluded.max_metrics,
+                                             updated_at = now()
         """,
         (d, json.dumps(stats), json.dumps(sleep), json.dumps(stress), json.dumps(hrv), json.dumps(max_metrics)),
     )
@@ -147,6 +158,9 @@ def main() -> None:
         client.login(tokenstore=str(TOKEN_DIR))
 
         today = date.today()
+        tables = ["activities", "challenges", "earned_badges", "available_badges", "daily_metrics"]
+        before = {t: table_count(conn, t) for t in tables}
+
         window_start = today - timedelta(days=LOOKBACK_DAYS)
 
         # Activities: date-range pagination, not offset-based — offset-based
@@ -180,11 +194,31 @@ def main() -> None:
 
         save_token_to_db(conn)
 
-    print(
-        f"Synced {len(activities)} activities, {len(challenges)} challenges, "
-        f"{len(earned_badges)} earned badges, {len(available_badges)} available badges, "
-        f"{LOOKBACK_DAYS + 1} days of daily metrics."
-    )
+        after = {t: table_count(conn, t) for t in tables}
+
+    api_counts = {
+        "activities": len(activities),
+        "challenges": len(challenges),
+        "earned_badges": len(earned_badges),
+        "available_badges": len(available_badges),
+    }
+
+    summary = ["### Garmin sync summary", "", "| Table | New rows | Fetched from API | Total in DB |", "|---|---|---|---|"]
+    for t in tables:
+        new_rows = after[t] - before[t]
+        fetched = api_counts.get(t, "—")
+        summary.append(f"| {t} | +{new_rows} | {fetched} | {after[t]} |")
+
+    total_new = sum(after[t] - before[t] for t in tables)
+    if total_new == 0:
+        summary.append("")
+        summary.append(
+            "_No new rows this run — normal if nothing changed on Garmin's side "
+            "since the last sync (e.g. a rest day). If you expected new activity "
+            "data and see 0 here, that's worth investigating._"
+        )
+
+    write_step_summary(summary)
 
 
 if __name__ == "__main__":
