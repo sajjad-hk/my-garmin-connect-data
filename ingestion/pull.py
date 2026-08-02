@@ -6,9 +6,11 @@ and pushed to the auth_tokens table via bootstrap/load_token_to_db.py.
 Each run:
   1. Pulls the current token from Postgres, writes it to the expected local path.
   2. Logs in to Garmin using that token (no password needed — resumes session).
-  3. Pulls activities and daily metrics for a lookback window (not just "today"),
-     so a missed run doesn't leave a permanent gap. Also refreshes challenges
-     and the full badges list.
+  3. Pulls activities, daily wellness metrics, and training insight for a
+     lookback window (not just "today"), so a missed run doesn't leave a
+     permanent gap. Also refreshes challenges, the full badges list, and
+     the snapshot-style tables (performance snapshots, personal records,
+     goals) that only ever reflect current state, not history.
   4. Upserts everything into the normalized tables.
   5. Reads back the (possibly refreshed) token files and saves them to Postgres,
      so the next ephemeral runner picks up the latest one.
@@ -106,9 +108,6 @@ def upsert_challenges(conn: psycopg.Connection, challenges: list[dict]) -> None:
 
 
 def upsert_earned_badges(conn: psycopg.Connection, badges: list[dict]) -> None:
-    # NOTE: assumes the id field is "badgeId" — same caveat as before, not yet
-    # verified against a live response. If this throws, print badges[0].keys()
-    # and fix the key name here.
     for b in badges:
         conn.execute(
             """
@@ -122,7 +121,6 @@ def upsert_earned_badges(conn: psycopg.Connection, badges: list[dict]) -> None:
 
 
 def upsert_available_badges(conn: psycopg.Connection, badges: list[dict]) -> None:
-    # Same field-name caveat as upsert_earned_badges.
     for b in badges:
         conn.execute(
             """
@@ -135,22 +133,103 @@ def upsert_available_badges(conn: psycopg.Connection, badges: list[dict]) -> Non
     conn.commit()
 
 
-def upsert_daily_metrics(conn: psycopg.Connection, d: date, stats, sleep, stress, hrv, max_metrics) -> None:
+DAILY_METRICS_COLUMNS = [
+    "stats", "sleep", "stress", "hrv", "max_metrics",
+    "respiration", "spo2", "body_battery", "body_battery_events",
+    "intensity_minutes", "floors", "steps_intraday", "heart_rates",
+    "day_events", "weigh_in",
+]
+
+
+def upsert_daily_metrics(conn: psycopg.Connection, d: date, fields: dict) -> None:
+    # coalesce(excluded.x, daily_metrics.x): a column not passed this call
+    # (fields.get(...) is None) keeps whatever was already stored, rather
+    # than nulling it out. Every call site must pass the *same* set of keys
+    # for this to stay predictable — see backfill.py's identical function.
+    cols = DAILY_METRICS_COLUMNS
+    values = [json.dumps(fields.get(c)) if fields.get(c) is not None else None for c in cols]
+    set_clause = ", ".join(f"{c} = coalesce(excluded.{c}, daily_metrics.{c})" for c in cols)
     conn.execute(
-        """
-        insert into daily_metrics (metric_date, stats, sleep, stress, hrv, max_metrics, updated_at)
-        values (%s, %s, %s, %s, %s, %s, now())
+        f"""
+        insert into daily_metrics (metric_date, {", ".join(cols)}, updated_at)
+        values (%s, {", ".join(["%s"] * len(cols))}, now())
             on conflict (metric_date) do update set
-            stats = excluded.stats,
-                                             sleep = excluded.sleep,
-                                             stress = excluded.stress,
-                                             hrv = excluded.hrv,
-                                             max_metrics = excluded.max_metrics,
-                                             updated_at = now()
-        """,
-        (d, json.dumps(stats), json.dumps(sleep), json.dumps(stress), json.dumps(hrv), json.dumps(max_metrics)),
+            {set_clause},
+            updated_at = now()
+        """,  # noqa: S608 (fixed column names, not user input)
+        (d, *values),
     )
     conn.commit()
+
+
+def upsert_training_insight(conn: psycopg.Connection, d: date, fields: dict) -> None:
+    cols = [
+        "training_status", "training_readiness", "morning_training_readiness",
+        "endurance_score", "hill_score", "fitness_age", "running_tolerance",
+    ]
+    values = [json.dumps(fields.get(c)) for c in cols]
+    set_clause = ", ".join(f"{c} = excluded.{c}" for c in cols)
+    conn.execute(
+        f"""
+        insert into training_insight (metric_date, {", ".join(cols)}, updated_at)
+        values (%s, {", ".join(["%s"] * len(cols))}, now())
+            on conflict (metric_date) do update set
+            {set_clause},
+            updated_at = now()
+        """,  # noqa: S608 (fixed column names, not user input)
+        (d, *values),
+    )
+    conn.commit()
+
+
+def upsert_performance_snapshots(conn: psycopg.Connection, snapshots: dict) -> None:
+    for metric_name, raw in snapshots.items():
+        conn.execute(
+            """
+            insert into performance_snapshots (metric_name, raw, updated_at)
+            values (%s, %s, now())
+                on conflict (metric_name) do update set raw = excluded.raw, updated_at = now()
+            """,
+            (metric_name, json.dumps(raw)),
+        )
+    conn.commit()
+
+
+def upsert_personal_records(conn: psycopg.Connection, records: list[dict]) -> None:
+    for r in records:
+        conn.execute(
+            """
+            insert into personal_records (record_id, raw, updated_at)
+            values (%s, %s, now())
+                on conflict (record_id) do update set raw = excluded.raw, updated_at = now()
+            """,
+            (r["id"], json.dumps(r)),
+        )
+    conn.commit()
+
+
+def replace_goals(conn: psycopg.Connection, status: str, goals: list[dict]) -> None:
+    # No verified id field exists for goal records (this account has none
+    # in any status to check against — see schema/init.sql). Full-replace
+    # per status instead of guessing a primary key to upsert on.
+    conn.execute("delete from goals where status = %s", (status,))
+    for g in goals:
+        conn.execute(
+            "insert into goals (status, raw, updated_at) values (%s, %s, now())",
+            (status, json.dumps(g)),
+        )
+    conn.commit()
+
+
+def upsert_body_battery(conn: psycopg.Connection, days: list[dict]) -> None:
+    for entry in days:
+        upsert_daily_metrics(conn, date.fromisoformat(entry["date"]), {"body_battery": entry})
+
+
+def upsert_weigh_ins(conn: psycopg.Connection, weigh_in_response: dict) -> None:
+    for summary in weigh_in_response.get("dailyWeightSummaries", []):
+        d = date.fromisoformat(summary["summaryDate"])
+        upsert_daily_metrics(conn, d, {"weigh_in": summary})
 
 
 def main() -> None:
@@ -161,7 +240,11 @@ def main() -> None:
         client.login(tokenstore=str(TOKEN_DIR))
 
         today = date.today()
-        tables = ["activities", "challenges", "earned_badges", "available_badges", "daily_metrics"]
+        tables = [
+            "activities", "challenges", "earned_badges", "available_badges",
+            "daily_metrics", "training_insight", "performance_snapshots",
+            "personal_records", "goals",
+        ]
         before = {t: table_count(conn, t) for t in tables}
 
         window_start = today - timedelta(days=LOOKBACK_DAYS)
@@ -183,17 +266,64 @@ def main() -> None:
         available_badges = client.get_available_badges()
         upsert_available_badges(conn, available_badges)
 
+        # Range endpoints that return a list keyed by date — fetched once
+        # for the whole lookback window rather than looped per date.
+        body_battery_days = client.get_body_battery(window_start.isoformat(), today.isoformat())
+        upsert_body_battery(conn, body_battery_days)
+
+        weigh_ins = client.get_weigh_ins(window_start.isoformat(), today.isoformat())
+        upsert_weigh_ins(conn, weigh_ins)
+
+        # Single-object "current state" snapshots — no history, refreshed
+        # in full every run, same idea as challenges/badges above.
+        performance_snapshots = {
+            "race_predictions": client.get_race_predictions(),
+            "cycling_ftp": client.get_cycling_ftp(),
+            "lactate_threshold": client.get_lactate_threshold(),
+        }
+        upsert_performance_snapshots(conn, performance_snapshots)
+
+        personal_records = client.get_personal_record()
+        upsert_personal_records(conn, personal_records)
+
+        goals_by_status = {}
+        for status in ("active", "future", "past"):
+            goals_by_status[status] = client.get_goals(status=status)
+            replace_goals(conn, status, goals_by_status[status])
+            time.sleep(1)
+
         # Daily metrics are per-date endpoints — loop the lookback window.
         for offset in range(LOOKBACK_DAYS + 1):
             d = window_start + timedelta(days=offset)
             iso = d.isoformat()
-            stats = client.get_stats(iso)
-            sleep = client.get_sleep_data(iso)
-            stress = client.get_all_day_stress(iso)
-            hrv = client.get_hrv_data(iso)
-            max_metrics = client.get_max_metrics(iso)
-            upsert_daily_metrics(conn, d, stats, sleep, stress, hrv, max_metrics)
-            time.sleep(1)  # be gentle — several calls per day, several days
+
+            upsert_daily_metrics(conn, d, {
+                "stats": client.get_stats(iso),
+                "sleep": client.get_sleep_data(iso),
+                "stress": client.get_all_day_stress(iso),
+                "hrv": client.get_hrv_data(iso),
+                "max_metrics": client.get_max_metrics(iso),
+                "respiration": client.get_respiration_data(iso),
+                "spo2": client.get_spo2_data(iso),
+                "body_battery_events": client.get_body_battery_events(iso),
+                "intensity_minutes": client.get_intensity_minutes_data(iso),
+                "floors": client.get_floors(iso),
+                "steps_intraday": client.get_steps_data(iso),
+                "heart_rates": client.get_heart_rates(iso),
+                "day_events": client.get_all_day_events(iso),
+            })
+
+            upsert_training_insight(conn, d, {
+                "training_status": client.get_training_status(iso),
+                "training_readiness": client.get_training_readiness(iso),
+                "morning_training_readiness": client.get_morning_training_readiness(iso),
+                "endurance_score": client.get_endurance_score(iso),
+                "hill_score": client.get_hill_score(iso),
+                "fitness_age": client.get_fitnessage_data(iso),
+                "running_tolerance": client.get_running_tolerance(iso, iso, aggregation="daily"),
+            })
+
+            time.sleep(1)  # be gentle — many calls per day, several days
 
         save_token_to_db(conn)
 
@@ -204,6 +334,9 @@ def main() -> None:
         "challenges": len(challenges),
         "earned_badges": len(earned_badges),
         "available_badges": len(available_badges),
+        "personal_records": len(personal_records),
+        "goals": sum(len(g) for g in goals_by_status.values()),
+        "performance_snapshots": len(performance_snapshots),
     }
 
     summary = ["### Garmin sync summary", "", "| Table | New rows | Fetched from API | Total in DB |", "|---|---|---|---|"]

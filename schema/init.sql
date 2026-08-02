@@ -23,15 +23,90 @@ create table if not exists challenges (
 
 -- One row per calendar date, holding whichever daily endpoints we pulled.
 -- Columns are nullable because backfill/incremental runs may populate them
--- at different times (e.g. stats today, sleep backfilled later).
+-- at different times (e.g. stats today, sleep backfilled later). weigh_in
+-- stays null forever on days with no scale reading — that's expected, not
+-- a sign the row wasn't processed.
 create table if not exists daily_metrics (
-    metric_date date primary key,
-    stats       jsonb,
-    sleep       jsonb,
-    stress      jsonb,
-    hrv         jsonb,
-    max_metrics jsonb,
+    metric_date          date primary key,
+    stats                jsonb,
+    sleep                jsonb,
+    stress               jsonb,
+    hrv                  jsonb,
+    max_metrics          jsonb,
+    respiration          jsonb,
+    spo2                 jsonb,
+    body_battery         jsonb,
+    body_battery_events  jsonb,
+    intensity_minutes    jsonb,
+    floors               jsonb,
+    steps_intraday       jsonb,
+    heart_rates          jsonb,
+    day_events           jsonb,
+    weigh_in             jsonb,
+    updated_at           timestamptz not null default now()
+);
+
+-- The columns above cover a fresh installation. Existing (already-provisioned)
+-- databases need these added explicitly, since `create table if not exists`
+-- is a no-op once the table exists.
+alter table daily_metrics add column if not exists respiration jsonb;
+alter table daily_metrics add column if not exists spo2 jsonb;
+alter table daily_metrics add column if not exists body_battery jsonb;
+alter table daily_metrics add column if not exists body_battery_events jsonb;
+alter table daily_metrics add column if not exists intensity_minutes jsonb;
+alter table daily_metrics add column if not exists floors jsonb;
+alter table daily_metrics add column if not exists steps_intraday jsonb;
+alter table daily_metrics add column if not exists heart_rates jsonb;
+alter table daily_metrics add column if not exists day_events jsonb;
+alter table daily_metrics add column if not exists weigh_in jsonb;
+
+-- Garmin's derived coaching/performance metrics, one row per calendar date.
+-- Kept separate from daily_metrics (wellness) since it's a distinct
+-- analytical domain — training load/readiness rather than raw health data.
+-- running_tolerance is fetched as a single-day window so it stores an
+-- empty array on days/accounts with no data, same as the others below.
+create table if not exists training_insight (
+    metric_date                 date primary key,
+    training_status             jsonb,
+    training_readiness          jsonb,
+    morning_training_readiness  jsonb,
+    endurance_score              jsonb,
+    hill_score                   jsonb,
+    fitness_age                  jsonb,
+    running_tolerance            jsonb,
+    updated_at                   timestamptz not null default now()
+);
+
+-- Single-object "current state" endpoints that have no natural list/id
+-- (race predictions, cycling FTP, lactate threshold) — one row per metric,
+-- refreshed in full on every sync. Same idea as challenges/badges but for
+-- endpoints that return one object instead of a list.
+create table if not exists performance_snapshots (
+    metric_name text primary key,
+    raw         jsonb not null,
     updated_at  timestamptz not null default now()
+);
+
+-- Personal records. Garmin keys these by a numeric "id" field (verified
+-- against a live response), same pattern as challenges/badges.
+create table if not exists personal_records (
+    record_id  bigint primary key,
+    raw        jsonb not null,
+    updated_at timestamptz not null default now()
+);
+
+-- Goals. NOTE: this account currently has zero goals in any status
+-- (active/future/past), so the live API response's natural id field could
+-- not be verified — unlike challenges/badges, do not assume one. Refreshed
+-- by delete-then-insert per status instead of upsert-by-id. If you later
+-- see real goal data, check for a stable id field and switch this to an
+-- upsert like personal_records, using a real primary key instead of the
+-- surrogate `id` below.
+create table if not exists goals (
+    id         bigserial primary key,
+    status     text not null,
+    raw        jsonb not null,
+    updated_at timestamptz not null default now()
 );
 
 -- Badges the account has already earned.
@@ -51,4 +126,3 @@ create table if not exists available_badges (
     updated_at timestamptz not null default now()
 );
 
--- Add as needed: goals, personal records, training status
